@@ -1,147 +1,137 @@
-import os
-import time
-import logging
-import requests
+import websocket
+import json
+import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+import time
+import requests
+from datetime import datetime
 
-# Environment setup
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# === CONFIG ===
+DERIV_APP_ID = "1089"  # Use your Deriv App ID here
+BOT_TOKEN = "8309380142:AAE-a5zBJVzrwcFBNwkgJvJwGSEPHV3yOsA"
+CHAT_ID = "5567741626"
 
 SYMBOLS = [
-    "R_10", "R_10_1s", "R_25", "R_25_1s", "R_50",
-    "R_50_1s", "R_75", "R_75_1s", "R_100", "R_100_1s"
+    "R_25",
+    "R_25_1S",
+    "R_75",
+    "R_75_1S"
 ]
 
-logging.basicConfig(level=logging.INFO)
+TIMEFRAME = 300  # 5 minutes in seconds
+CANDLE_COUNT = 100
+
+RSI_PERIOD = 14
+STOCH_PERIOD = 14
+STOCH_SIGNAL = 3
+BOLL_PERIOD = 20
+BOLL_STD_DEV = 2
+
+RSI_OVERBOUGHT = 74
+RSI_OVERSOLD = 26
+STOCH_OVERBOUGHT = 92.5
+STOCH_OVERSOLD = 7.5
+
+# === FUNCTIONS ===
 
 def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message}
     try:
-        r = requests.post(url, data=data)
-        if r.status_code != 200:
-            logging.error(f"Telegram Error: {r.text}")
+        requests.post(url, json=payload)
     except Exception as e:
-        logging.error(f"Telegram send error: {e}")
+        print(f"Telegram send error: {e}")
 
-def fetch_candles(symbol, count=100):
-    url = "https://api.deriv.com/api/websockets/v3"
-    response = requests.get(
-        f"https://api.deriv.com/api/exchange/v1/price?index={symbol}&interval=5m&count={count}"
-    )
-    try:
-        data = response.json()
-        candles = data["candles"]
-        return candles
-    except:
-        logging.error(f"Failed to fetch data for {symbol}")
-        return []
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
-def calculate_indicators(candles):
-    closes = np.array([c["close"] for c in candles])
+def stochastic_kd(df, k_period=14, d_period=3):
+    low_min = df['low'].rolling(window=k_period).min()
+    high_max = df['high'].rolling(window=k_period).max()
+    k = 100 * (df['close'] - low_min) / (high_max - low_min)
+    d = k.rolling(window=d_period).mean()
+    return k, d
 
-    # Bollinger Bands
-    period = 20
-    sma = np.convolve(closes, np.ones(period)/period, mode='valid')
-    std = np.std(closes[-period:])
-    upper_band = sma[-1] + 2 * std
-    lower_band = sma[-1] - 2 * std
-    last_close = closes[-1]
+def bollinger_bands(series, period=20, std_dev=2):
+    sma = series.rolling(window=period).mean()
+    std = series.rolling(window=period).std()
+    upper_band = sma + (std * std_dev)
+    lower_band = sma - (std * std_dev)
+    return upper_band, lower_band
 
-    # RSI
-    delta = np.diff(closes)
-    up = np.where(delta > 0, delta, 0)
-    down = np.where(delta < 0, -delta, 0)
-    avg_gain = np.mean(up[-14:])
-    avg_loss = np.mean(down[-14:])
-    rs = avg_gain / avg_loss if avg_loss != 0 else 0
-    rsi = 100 - (100 / (1 + rs))
+def analyze(df, symbol):
+    last_close = df['close'].iloc[-1]
+    rsi_value = rsi(df['close'], RSI_PERIOD).iloc[-1]
+    k_value, d_value = stochastic_kd(df, STOCH_PERIOD, STOCH_SIGNAL)
+    stoch_k = k_value.iloc[-1]
+    stoch_d = d_value.iloc[-1]
+    upper_band, lower_band = bollinger_bands(df['close'], BOLL_PERIOD, BOLL_STD_DEV)
+    upper_bb = upper_band.iloc[-1]
+    lower_bb = lower_band.iloc[-1]
 
-    # Stochastic Oscillator
-    k_period = 14
-    lows = np.array([c["low"] for c in candles])
-    highs = np.array([c["high"] for c in candles])
-    low_min = np.min(lows[-k_period:])
-    high_max = np.max(highs[-k_period:])
-    stoch_k = 100 * ((closes[-1] - low_min) / (high_max - low_min)) if high_max != low_min else 0
-    stoch_d = np.mean([stoch_k for _ in range(3)])  # Simple smoothing
+    signal = None
 
-    return {
-        "last_close": last_close,
-        "upper_band": upper_band,
-        "lower_band": lower_band,
-        "rsi": rsi,
-        "stoch_k": stoch_k,
-        "stoch_d": stoch_d
+    # Buy condition
+    if (rsi_value <= RSI_OVERSOLD) and (stoch_k <= STOCH_OVERSOLD or stoch_d <= STOCH_OVERSOLD) and (last_close <= lower_bb):
+        signal = "BUY"
+
+    # Sell condition
+    elif (rsi_value >= RSI_OVERBOUGHT) and (stoch_k >= STOCH_OVERBOUGHT or stoch_d >= STOCH_OVERBOUGHT) and (last_close >= upper_bb):
+        signal = "SELL"
+
+    if signal:
+        msg = (
+            f"📢 Precision Vix Bot Signal\n"
+            f"Symbol: {symbol}\n"
+            f"Signal: {signal}\n"
+            f"RSI: {rsi_value:.2f}\n"
+            f"Stoch K: {stoch_k:.2f} | Stoch D: {stoch_d:.2f}\n"
+            f"Close Price: {last_close:.2f}\n"
+            f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
+        send_telegram_message(msg)
+
+def fetch_candles(symbol):
+    ws = websocket.create_connection("wss://ws.binaryws.com/websockets/v3?app_id=" + DERIV_APP_ID)
+    params = {
+        "ticks_history": symbol,
+        "adjust_start_time": 1,
+        "count": CANDLE_COUNT,
+        "end": "latest",
+        "style": "candles",
+        "granularity": TIMEFRAME
     }
+    ws.send(json.dumps(params))
+    data = json.loads(ws.recv())
+    ws.close()
 
-def validate_buy_condition(prev_rsi, rsi, stoch_k, stoch_d, prev_k, prev_d, price, lower_band):
-    return (
-        price < lower_band and
-        prev_rsi < 26 and rsi > 26 and
-        prev_k < prev_d and stoch_k > stoch_d and
-        prev_k < 7.5 and stoch_k > 7.5
-    )
+    if "candles" in data:
+        candles = data["candles"]
+        df = pd.DataFrame(candles)
+        df['open'] = df['open'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
+        df['close'] = df['close'].astype(float)
+        return df
+    else:
+        return None
 
-def validate_sell_condition(prev_rsi, rsi, stoch_k, stoch_d, prev_k, prev_d, price, upper_band):
-    return (
-        price > upper_band and
-        prev_rsi > 74 and rsi < 74 and
-        prev_k > prev_d and stoch_k < stoch_d and
-        prev_k > 92.5 and stoch_k < 92.5
-    )
-
-def check_strategy(symbol):
-    candles = fetch_candles(symbol, count=100)
-    if len(candles) < 21:
-        logging.warning(f"Not enough candles for {symbol}")
-        return
-
-    indicators = calculate_indicators(candles)
-    prev = calculate_indicators(candles[:-1])  # previous candle
-
-    # Unpack
-    price = indicators["last_close"]
-    upper_band = indicators["upper_band"]
-    lower_band = indicators["lower_band"]
-    rsi = indicators["rsi"]
-    prev_rsi = prev["rsi"]
-    stoch_k = indicators["stoch_k"]
-    stoch_d = indicators["stoch_d"]
-    prev_k = prev["stoch_k"]
-    prev_d = prev["stoch_d"]
-
-    # Conditions
-    if validate_buy_condition(prev_rsi, rsi, stoch_k, stoch_d, prev_k, prev_d, price, lower_band):
-        message = (
-            f"🟢 *BUY Signal* — {symbol}\n\n"
-            f"📉 Price: {price:.2f}\n"
-            f"📊 RSI: {rsi:.2f} (prev: {prev_rsi:.2f})\n"
-            f"🌀 Stochastic: K={stoch_k:.2f}, D={stoch_d:.2f}\n"
-            f"📍 BB Lower Band: {lower_band:.2f}\n"
-            f"⏰ Entry in 2 minutes!"
-        )
-        send_telegram_message(message)
-
-    elif validate_sell_condition(prev_rsi, rsi, stoch_k, stoch_d, prev_k, prev_d, price, upper_band):
-        message = (
-            f"🔴 *SELL Signal* — {symbol}\n\n"
-            f"📈 Price: {price:.2f}\n"
-            f"📊 RSI: {rsi:.2f} (prev: {prev_rsi:.2f})\n"
-            f"🌀 Stochastic: K={stoch_k:.2f}, D={stoch_d:.2f}\n"
-            f"📍 BB Upper Band: {upper_band:.2f}\n"
-            f"⏰ Entry in 2 minutes!"
-        )
-        send_telegram_message(message)
-
-def main():
+def run_bot():
     while True:
-        logging.info("🔄 Scanning for signals...")
-        for symbol in SYMBOLS:
-            check_strategy(symbol)
-        time.sleep(300)  # Run every 5 minutes
+        try:
+            for symbol in SYMBOLS:
+                df = fetch_candles(symbol)
+                if df is not None and len(df) > RSI_PERIOD:
+                    analyze(df, symbol)
+            time.sleep(TIMEFRAME)
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    send_telegram_message("🚀 Precision Vix Bot is now running...")
+    run_bot()
