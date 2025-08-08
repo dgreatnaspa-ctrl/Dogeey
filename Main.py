@@ -1,13 +1,3 @@
-#!/usr/bin/env python3
-"""
-Precision Vix Bot - 5m candle based
-Sends signals to Telegram when:
-  - Stochastic (%K or %D) touches OB/OS (92.5 / 7.5)
-  - AND RSI confirms (>=74 for sell, <=26 for buy)
-  - AND price is outside corresponding Bollinger Band (upper for sell, lower for buy)
-Sends one alert per signal change (rate-limited).
-"""
-
 import os
 import time
 import json
