@@ -1,137 +1,239 @@
-import websocket
+#!/usr/bin/env python3
+"""
+Precision Vix Bot - 5m candle based
+Sends signals to Telegram when:
+  - Stochastic (%K or %D) touches OB/OS (92.5 / 7.5)
+  - AND RSI confirms (>=74 for sell, <=26 for buy)
+  - AND price is outside corresponding Bollinger Band (upper for sell, lower for buy)
+Sends one alert per signal change (rate-limited).
+"""
+
+import os
+import time
 import json
+import logging
+from datetime import datetime
+from dotenv import load_dotenv
+
+import websocket
 import pandas as pd
 import numpy as np
-import time
 import requests
-from datetime import datetime
 
-# === CONFIG ===
-DERIV_APP_ID = "1089"  # Use your Deriv App ID here
-BOT_TOKEN = "8309380142:AAE-a5zBJVzrwcFBNwkgJvJwGSEPHV3yOsA"
-CHAT_ID = "5567741626"
+load_dotenv()
 
-SYMBOLS = [
-    "R_25",
-    "R_25_1S",
-    "R_75",
-    "R_75_1S"
-]
+# ---------- CONFIG (from env) ----------
+DERIV_WS_URL = os.getenv("DERIV_WS_URL", "wss://ws.binaryws.com/websockets/v3")
+DERIV_APP_ID = os.getenv("DERIV_APP_ID", "")  # optional
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "R_50,R_75,R_100,R_25").split(",") if s.strip()]
 
-TIMEFRAME = 300  # 5 minutes in seconds
-CANDLE_COUNT = 100
+TIMEFRAME = int(os.getenv("TIMEFRAME", "300"))  # 5 minutes in seconds
+CANDLE_COUNT = int(os.getenv("CANDLE_COUNT", "200"))
 
-RSI_PERIOD = 14
-STOCH_PERIOD = 14
-STOCH_SIGNAL = 3
-BOLL_PERIOD = 20
-BOLL_STD_DEV = 2
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+STOCH_K_PERIOD = int(os.getenv("STOCH_K_PERIOD", "14"))
+STOCH_D_PERIOD = int(os.getenv("STOCH_D_PERIOD", "3"))
+BOLL_PERIOD = int(os.getenv("BOLL_PERIOD", "20"))
+BOLL_STD = float(os.getenv("BOLL_STD", "2"))
 
-RSI_OVERBOUGHT = 74
-RSI_OVERSOLD = 26
-STOCH_OVERBOUGHT = 92.5
-STOCH_OVERSOLD = 7.5
+RSI_OVERBOUGHT = float(os.getenv("RSI_OVERBOUGHT", "74"))
+RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "26"))
+STOCH_OVERBOUGHT = float(os.getenv("STOCH_OVERBOUGHT", "92.5"))
+STOCH_OVERSOLD = float(os.getenv("STOCH_OVERSOLD", "7.5"))
 
-# === FUNCTIONS ===
+CHECK_INTERVAL = TIMEFRAME  # run every candle
 
-def send_telegram_message(message):
+# ---------- Logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# ---------- Utilities ----------
+def send_telegram_message(text: str):
+    if not BOT_TOKEN or not CHAT_ID:
+        logging.warning("Telegram token/chat not set - skipping send.")
+        return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json=payload)
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            logging.warning("Telegram send failed: %s", r.text)
     except Exception as e:
-        print(f"Telegram send error: {e}")
+        logging.error("Telegram exception: %s", e)
 
-def rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+def fetch_candles(symbol: str, count: int = CANDLE_COUNT, granularity: int = TIMEFRAME):
+    """
+    Request ticks_history (candles) from Deriv via ephemeral websocket connection.
+    Returns pandas.DataFrame or None.
+    """
+    # build ws url with app_id if provided
+    ws_url = DERIV_WS_URL
+    if DERIV_APP_ID:
+        if "?" in ws_url:
+            ws_url = ws_url + "&app_id=" + DERIV_APP_ID
+        else:
+            ws_url = ws_url + "?app_id=" + DERIV_APP_ID
 
-def stochastic_kd(df, k_period=14, d_period=3):
-    low_min = df['low'].rolling(window=k_period).min()
-    high_max = df['high'].rolling(window=k_period).max()
-    k = 100 * (df['close'] - low_min) / (high_max - low_min)
-    d = k.rolling(window=d_period).mean()
-    return k, d
-
-def bollinger_bands(series, period=20, std_dev=2):
-    sma = series.rolling(window=period).mean()
-    std = series.rolling(window=period).std()
-    upper_band = sma + (std * std_dev)
-    lower_band = sma - (std * std_dev)
-    return upper_band, lower_band
-
-def analyze(df, symbol):
-    last_close = df['close'].iloc[-1]
-    rsi_value = rsi(df['close'], RSI_PERIOD).iloc[-1]
-    k_value, d_value = stochastic_kd(df, STOCH_PERIOD, STOCH_SIGNAL)
-    stoch_k = k_value.iloc[-1]
-    stoch_d = d_value.iloc[-1]
-    upper_band, lower_band = bollinger_bands(df['close'], BOLL_PERIOD, BOLL_STD_DEV)
-    upper_bb = upper_band.iloc[-1]
-    lower_bb = lower_band.iloc[-1]
-
-    signal = None
-
-    # Buy condition
-    if (rsi_value <= RSI_OVERSOLD) and (stoch_k <= STOCH_OVERSOLD or stoch_d <= STOCH_OVERSOLD) and (last_close <= lower_bb):
-        signal = "BUY"
-
-    # Sell condition
-    elif (rsi_value >= RSI_OVERBOUGHT) and (stoch_k >= STOCH_OVERBOUGHT or stoch_d >= STOCH_OVERBOUGHT) and (last_close >= upper_bb):
-        signal = "SELL"
-
-    if signal:
-        msg = (
-            f"📢 Precision Vix Bot Signal\n"
-            f"Symbol: {symbol}\n"
-            f"Signal: {signal}\n"
-            f"RSI: {rsi_value:.2f}\n"
-            f"Stoch K: {stoch_k:.2f} | Stoch D: {stoch_d:.2f}\n"
-            f"Close Price: {last_close:.2f}\n"
-            f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-        )
-        send_telegram_message(msg)
-
-def fetch_candles(symbol):
-    ws = websocket.create_connection("wss://ws.binaryws.com/websockets/v3?app_id=" + DERIV_APP_ID)
-    params = {
+    payload = {
         "ticks_history": symbol,
-        "adjust_start_time": 1,
-        "count": CANDLE_COUNT,
-        "end": "latest",
         "style": "candles",
-        "granularity": TIMEFRAME
+        "granularity": granularity,
+        "count": count,
+        "end": "latest",
+        "subscribe": 0
     }
-    ws.send(json.dumps(params))
-    data = json.loads(ws.recv())
-    ws.close()
-
-    if "candles" in data:
-        candles = data["candles"]
-        df = pd.DataFrame(candles)
-        df['open'] = df['open'].astype(float)
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
-        df['close'] = df['close'].astype(float)
-        return df
-    else:
+    try:
+        ws = websocket.create_connection(ws_url, timeout=8)
+        ws.send(json.dumps(payload))
+        raw = ws.recv()
+        ws.close()
+        data = json.loads(raw)
+    except Exception as e:
+        logging.warning("Fetch candles error for %s: %s", symbol, e)
         return None
 
-def run_bot():
+    if not data or 'history' not in data or 'candles' not in data['history']:
+        logging.debug("No candles returned for %s: %s", symbol, data)
+        return None
+
+    candles = data['history']['candles']
+    df = pd.DataFrame(candles)
+    # ensure numeric types
+    for c in ['open', 'high', 'low', 'close']:
+        df[c] = df[c].astype(float)
+    df['epoch'] = pd.to_datetime(df['epoch'], unit='s')
+    df.set_index('epoch', inplace=True)
+    return df
+
+# ---------- Indicators ----------
+def compute_rsi(series: pd.Series, period: int = RSI_PERIOD):
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = ma_up / (ma_down + 1e-12)
+    return 100 - (100 / (1 + rs))
+
+def compute_stochastic(df: pd.DataFrame, k_period: int = STOCH_K_PERIOD, d_period: int = STOCH_D_PERIOD):
+    low_min = df['low'].rolling(window=k_period, min_periods=1).min()
+    high_max = df['high'].rolling(window=k_period, min_periods=1).max()
+    k = 100 * (df['close'] - low_min) / (high_max - low_min + 1e-12)
+    d = k.rolling(window=d_period, min_periods=1).mean()
+    return k, d
+
+def compute_bbands(series: pd.Series, period: int = BOLL_PERIOD, nstd: float = BOLL_STD):
+    ma = series.rolling(window=period, min_periods=1).mean()
+    std = series.rolling(window=period, min_periods=1).std().fillna(0)
+    upper = ma + nstd * std
+    lower = ma - nstd * std
+    return upper, ma, lower
+
+# ---------- Strategy / Decision ----------
+last_sent = {}  # {symbol: {"signal": str, "ts": epoch}}
+
+def analyze_symbol(symbol: str):
+    df = fetch_candles(symbol)
+    if df is None or len(df) < max(BOLL_PERIOD, RSI_PERIOD, STOCH_K_PERIOD) + 1:
+        logging.info("[%s] not enough data", symbol)
+        return
+
+    # compute indicators
+    df = df.copy()
+    df['rsi'] = compute_rsi(df['close'], RSI_PERIOD)
+    k, d = compute_stochastic(df, STOCH_K_PERIOD, STOCH_D_PERIOD)
+    df['stoch_k'] = k
+    df['stoch_d'] = d
+    upper, mid, lower = compute_bbands(df['close'], BOLL_PERIOD, BOLL_STD)
+    df['bb_upper'] = upper
+    df['bb_mid'] = mid
+    df['bb_lower'] = lower
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else last
+
+    rsi_val = float(last['rsi'])
+    stoch_k = float(last['stoch_k'])
+    stoch_d = float(last['stoch_d'])
+    close = float(last['close'])
+    upper_bb = float(last['bb_upper'])
+    lower_bb = float(last['bb_lower'])
+
+    # Check stochastic touch (no crossover required)
+    touch_overb = (stoch_k >= STOCH_OVERBOUGHT) or (stoch_d >= STOCH_OVERBOUGHT)
+    touch_overs = (stoch_k <= STOCH_OVERSOLD) or (stoch_d <= STOCH_OVERSOLD)
+
+    signal = None
+    reason = []
+
+    # SELL: price >= upper BB, RSI >= overbought, stochastic touches overbought
+    if touch_overb and (rsi_val >= RSI_OVERBOUGHT) and (close >= upper_bb):
+        signal = "SELL"
+        reason = f"Stoch_touch(OB) + RSI {rsi_val:.2f} >= {RSI_OVERBOUGHT} + close >= upper_BB"
+
+    # BUY: price <= lower BB, RSI <= oversold, stochastic touches oversold
+    elif touch_overs and (rsi_val <= RSI_OVERSOLD) and (close <= lower_bb):
+        signal = "BUY"
+        reason = f"Stoch_touch(OS) + RSI {rsi_val:.2f} <= {RSI_OVERSOLD} + close <= lower_BB"
+
+    # Optionally: you can add weaker signals if you want more freq (commented)
+    # elif touch_overs and rsi_val <= (RSI_OVERSOLD + 5):
+    #     signal = "WEAK BUY"
+    # ... etc.
+
+    if signal:
+        prev_sig = last_sent.get(symbol, {}).get("signal")
+        # send if changed (or not sent before)
+        if prev_sig != signal:
+            msg = build_message(symbol, signal, rsi_val, stoch_k, stoch_d, close, upper_bb, lower_bb, reason)
+            send_telegram_message(msg)
+            last_sent[symbol] = {"signal": signal, "ts": time.time()}
+            logging.info("[%s] Sent %s | %s", symbol, signal, reason)
+        else:
+            logging.debug("[%s] Same signal (%s) - not resending", symbol, signal)
+    else:
+        logging.debug("[%s] No valid signal. rsi=%.2f stoch_k=%.2f stoch_d=%.2f close=%.5f", symbol, rsi_val, stoch_k, stoch_d, close)
+
+def build_message(symbol, signal, rsi_val, stoch_k, stoch_d, close, upper_bb, lower_bb, reason):
+    t = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    msg = (
+        f"📊 *Precision Vix Bot*\n"
+        f"*Symbol:* `{symbol}`\n"
+        f"*Signal:* *{signal}*\n"
+        f"*Time (UTC):* `{t}`\n"
+        f"*Reason:* {reason}\n\n"
+        f"*Indicators:*\n"
+        f"• RSI: `{rsi_val:.2f}`\n"
+        f"• Stoch K/D: `{stoch_k:.2f}` / `{stoch_d:.2f}`\n"
+        f"• Close: `{close:.5f}`\n"
+        f"• BB Upper: `{upper_bb:.5f}`  BB Lower: `{lower_bb:.5f}`\n\n"
+        f"_Action:_ Enter at next 5m candle open. Suggested expiry: *10m*"
+    )
+    return msg
+
+# ---------- Runner ----------
+def run_loop():
+    logging.info("Starting Precision Vix Bot for symbols: %s", SYMBOLS)
+    # send one start message
+    send_telegram_message("🚀 Precision Vix Bot (5m) is now running.")
     while True:
         try:
-            for symbol in SYMBOLS:
-                df = fetch_candles(symbol)
-                if df is not None and len(df) > RSI_PERIOD:
-                    analyze(df, symbol)
-            time.sleep(TIMEFRAME)
+            for sym in SYMBOLS:
+                try:
+                    analyze_symbol(sym)
+                except Exception as e:
+                    logging.exception("Error analyzing %s: %s", sym, e)
+            time.sleep(CHECK_INTERVAL)
+        except KeyboardInterrupt:
+            logging.info("Stopped by user")
+            break
         except Exception as e:
-            print(f"Error: {e}")
+            logging.exception("Main loop error: %s", e)
             time.sleep(5)
 
 if __name__ == "__main__":
-    send_telegram_message("🚀 Precision Vix Bot is now running...")
-    run_bot()
+    run_loop()
