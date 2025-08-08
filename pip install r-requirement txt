@@ -1,0 +1,5 @@
+3. Edit `.env`:
+- Put your Telegram bot token and chat id
+- Optionally change SYMBOLS or thresholds
+
+4. Run:
